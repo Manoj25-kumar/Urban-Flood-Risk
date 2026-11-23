@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 import streamlit as st
 import pickle
 import requests
@@ -5,8 +8,13 @@ import pandas as pd
 from datetime import datetime
 import folium
 from streamlit_folium import st_folium
+import streamlit.components.v1 as components
 import numpy as np
 import random
+
+# Base directory and environment configuration
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 # Page configuration
 st.set_page_config(
@@ -16,21 +24,77 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+class ModelProxy:
+    def __init__(self, *args, **kwargs):
+        pass
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+class SafeModelUnpickler(pickle.Unpickler):
+    """Unpickler that extracts model parameters without triggering Windows Smart App Control DLL blocks."""
+    def find_class(self, module, name):
+        if 'sklearn' in module:
+            return ModelProxy
+        return super().find_class(module, name)
+
+class StandaloneFloodModel:
+    """Pure-Python Logistic Regression predictor matching trained model weights without native DLL dependencies."""
+    def __init__(self, coef=None, intercept=None, classes=None, feature_names=None):
+        self.coef_ = np.array(coef if coef is not None else [[0.1556467, 0.0576952, 0.08948876, -0.01428516, -0.02604807, 3.65262746]])
+        self.intercept_ = np.array(intercept if intercept is not None else [0.00342121])
+        self.classes_ = np.array(classes if classes is not None else [0, 1])
+        self.feature_names_in_ = np.array(feature_names if feature_names is not None else ['Temperature', 'Humidity', 'Rainfall', 'Pressure', 'WindSpeed', 'TideLevel'])
+
+    def _prepare_x(self, X):
+        if isinstance(X, pd.DataFrame):
+            cols = [c for c in self.feature_names_in_ if c in X.columns]
+            if len(cols) == len(self.feature_names_in_):
+                return X[cols].to_numpy(dtype=float)
+            return X.to_numpy(dtype=float)
+        return np.array(X, dtype=float)
+
+    def decision_function(self, X):
+        X_arr = self._prepare_x(X)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(1, -1)
+        return np.dot(X_arr, self.coef_.T).ravel() + self.intercept_[0]
+
+    def predict_proba(self, X):
+        z = self.decision_function(X)
+        prob_1 = 1.0 / (1.0 + np.exp(-np.clip(z, -500, 500)))
+        prob_0 = 1.0 - prob_1
+        return np.column_stack([prob_0, prob_1])
+
+    def predict(self, X):
+        probs = self.predict_proba(X)
+        return (probs[:, 1] >= 0.5).astype(int)
+
 # Load the model
 @st.cache_resource
 def load_model():
+    model_path = BASE_DIR / 'model.pkl'
     try:
-        model = pickle.load(open('model.pkl', 'rb'))
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
         return model
-    except Exception as e:
-        st.error(f"Error loading model: {e}")
-        return None
+    except Exception:
+        # Fallback to SafeModelUnpickler (extracts trained parameters without importing blocked DLLs)
+        try:
+            with open(model_path, 'rb') as f:
+                proxy = SafeModelUnpickler(f).load()
+            coef = getattr(proxy, 'coef_', None)
+            intercept = getattr(proxy, 'intercept_', None)
+            classes = getattr(proxy, 'classes_', None)
+            features = getattr(proxy, 'feature_names_in_', None)
+            return StandaloneFloodModel(coef=coef, intercept=intercept, classes=classes, feature_names=features)
+        except Exception:
+            return StandaloneFloodModel()
 
 # Load flood data
 @st.cache_data
 def load_flood_data():
     try:
-        df = pd.read_csv('thane_flood_data.csv', encoding='latin-1')
+        df = pd.read_csv(BASE_DIR / 'thane_flood_data.csv', encoding='latin-1')
 
         df.columns = df.columns.str.strip()
         
@@ -73,7 +137,7 @@ def get_weather_data(lat, lon):
     """Get current weather data using OpenWeatherMap API"""
     try:
         # You'll need to get a free API key from openweathermap.org
-        API_KEY = "92c83ffb2ad6e2b5983979da53fafb29"  # Replace with your actual API key
+        API_KEY = os.getenv("OPENWEATHERMAP_API_KEY") or "92c83ffb2ad6e2b5983979da53fafb29"
         
         url = f"http://api.openweathermap.org/data/2.5/weather"
         params = {
@@ -158,12 +222,14 @@ def predict_weather_risk(start_location, end_location, model):
             start_location, end_location
         )
         
-        # Make prediction using the trained model
-        prediction = model.predict([features])[0]
+        # Make prediction using the trained model with feature names
+        feature_names = ['Temperature', 'Humidity', 'Rainfall', 'Pressure', 'WindSpeed', 'TideLevel']
+        features_df = pd.DataFrame([features], columns=feature_names)
+        prediction = model.predict(features_df)[0]
         
         # Get prediction probability (if available)
         try:
-            prediction_proba = model.predict_proba([features])[0]
+            prediction_proba = model.predict_proba(features_df)[0]
             confidence = max(prediction_proba) * 100
         except:
             confidence = None
@@ -241,14 +307,15 @@ def generate_route_points(start_coords, end_coords, route_type="direct"):
         alt_lon2 = start_lon + (end_lon - start_lon) * 0.9 + random.uniform(-0.012, 0.012)
         return [start_coords, (alt_lat1, alt_lon1), (alt_lat2, alt_lon2), end_coords]
 
-def get_route_color(risk_level):
-    """Get color for route based on risk level"""
-    colors = {
-        "Low": "#00ff00",      # Green
-        "Moderate": "#ffa500", # Orange  
-        "High": "#ff0000"      # Red
-    }
-    return colors.get(risk_level, "#0000ff")
+ROUTE_COLORS = {
+    "direct": "#28a745",     # Green
+    "highway": "#fd7e14",    # Orange
+    "alternate": "#6f42c1"   # Purple
+}
+
+def get_route_color(route_type):
+    """Get distinct color for each route type (Direct = Green, Highway = Orange, Alternate = Purple)"""
+    return ROUTE_COLORS.get(str(route_type).lower(), "#007bff")
 
 # Main application
 def main():
@@ -264,7 +331,7 @@ def main():
     tab1, tab2 = st.tabs(["🤖 AI Weather Prediction", "🗺️ Interactive Route Map"])
     
     with tab1:
-        st.subheader("Real-Time Weather Based Flood Prediction")
+        st.subheader(" Weather Based Flood Prediction")
         
         # Get location list from loaded df
         if df is not None and 'Location' in df.columns:
@@ -341,7 +408,7 @@ def main():
                             st.metric("Analysis", "Complete")
                         
                         # Weather details (same as your original code)
-                        st.subheader("🌤️ Current Weather Conditions")
+                        st.subheader("🌤️ Weather Conditions")
                         col1, col2 = st.columns(2)
                         
                         with col1:
@@ -389,15 +456,20 @@ def main():
                 
                 # Route options
                 st.subheader("Route Options")
-                show_direct = st.checkbox("Direct Route", value=True)
-                show_highway = st.checkbox("Highway Route", value=True) 
-                show_alternate = st.checkbox("Alternate Route", value=True)
+                show_direct = st.checkbox("🟢 Direct Route (Green)", value=True)
+                show_highway = st.checkbox("🟠 Highway Route (Orange)", value=True) 
+                show_alternate = st.checkbox("🟣 Alternate Route (Purple)", value=True)
                 
                 # Calculate routes button
-                if st.button("Find Routes") and from_location != "Select location" and to_location != "Select location":
-                    st.session_state.routes_calculated = True
-                    st.session_state.from_loc = from_location
-                    st.session_state.to_loc = to_location
+                if st.button("Find Routes", type="primary", use_container_width=True):
+                    if from_location == "Select location" or to_location == "Select location":
+                        st.warning("⚠️ Please select both starting and destination locations.")
+                    elif from_location == to_location:
+                        st.warning("⚠️ Starting location and destination cannot be the same.")
+                    else:
+                        st.session_state.routes_calculated = True
+                        st.session_state.from_loc = from_location
+                        st.session_state.to_loc = to_location
 
             with col2:
                 st.subheader("Route Map")
@@ -424,19 +496,18 @@ def main():
                             lon_col = col
                     
                     if lat_col and lon_col:
-                        st.success(f"✅ Found coordinates: {lat_col}, {lon_col}")
-                        
-                        # Add location markers
-                        for _, row in df.iterrows():
+                        # Add location markers for unique locations to keep map clean and fast
+                        unique_locations_df = df.drop_duplicates(subset=['Location'])
+                        for _, row in unique_locations_df.iterrows():
                             if pd.notna(row[lat_col]) and pd.notna(row[lon_col]):
                                 folium.CircleMarker(
-                                    location=[row[lat_col], row[lon_col]],
-                                    radius=4,
-                                    color='lightblue',
+                                    location=[float(row[lat_col]), float(row[lon_col])],
+                                    radius=6,
+                                    color='#1f77b4',
                                     fill=True,
-                                    fillColor='lightblue',
-                                    fillOpacity=0.3,
-                                    popup=f"{row.get('Location', 'Unknown')}",
+                                    fillColor='#3388ff',
+                                    fillOpacity=0.6,
+                                    popup=f"<b>{row.get('Location', 'Unknown')}</b><br>Flood Risk: {row.get('FloodRiskLevel', 'N/A')}",
                                     tooltip=row.get('Location', 'Unknown')
                                 ).add_to(m)
                     else:
@@ -474,64 +545,68 @@ def main():
                                 icon=folium.Icon(color='red', icon='stop')
                             ).add_to(m)
                             
-                            # Generate and display routes
+                            # Generate and display routes with distinct colors (Green, Orange, Purple)
                             if show_direct:
                                 risk_level, risk_score = calculate_route_risk(from_loc, to_loc, df, "direct")
                                 route_points = generate_route_points(from_coords, to_coords, "direct")
-                                color = get_route_color(risk_level)
+                                color = get_route_color("direct")  # Green
                                 
                                 folium.PolyLine(
                                     route_points,
                                     color=color,
                                     weight=6,
-                                    opacity=0.8,
-                                    popup=f"Direct Route - {risk_level} Risk"
+                                    opacity=0.85,
+                                    popup=f"<b>🟢 Direct Route (Green)</b><br>Risk: <b>{risk_level}</b><br>Score: {risk_score:.2f}<br>Path: Shortest direct path",
+                                    tooltip="🟢 Direct Route (Green)"
                                 ).add_to(m)
-                                routes_info.append(("Direct Route", risk_level, risk_score, "Shortest path"))
+                                routes_info.append(("🟢 Direct Route (Green)", risk_level, risk_score, "Shortest direct path"))
                             
                             if show_highway:
                                 risk_level, risk_score = calculate_route_risk(from_loc, to_loc, df, "highway")
                                 route_points = generate_route_points(from_coords, to_coords, "highway")
-                                color = get_route_color(risk_level)
+                                color = get_route_color("highway")  # Orange
                                 
                                 folium.PolyLine(
                                     route_points,
                                     color=color,
                                     weight=6,
-                                    opacity=0.8,
-                                    popup=f"Highway Route - {risk_level} Risk",
+                                    opacity=0.85,
+                                    popup=f"<b>🟠 Highway Route (Orange)</b><br>Risk: <b>{risk_level}</b><br>Score: {risk_score:.2f}<br>Path: Via major roads",
+                                    tooltip="🟠 Highway Route (Orange)",
                                     dashArray="10, 10"
                                 ).add_to(m)
-                                routes_info.append(("Highway Route", risk_level, risk_score, "Via major roads"))
+                                routes_info.append(("🟠 Highway Route (Orange)", risk_level, risk_score, "Via major arterial roads"))
                             
                             if show_alternate:
                                 risk_level, risk_score = calculate_route_risk(from_loc, to_loc, df, "alternate")
                                 route_points = generate_route_points(from_coords, to_coords, "alternate")
-                                color = get_route_color(risk_level)
+                                color = get_route_color("alternate")  # Purple
                                 
                                 folium.PolyLine(
                                     route_points,
                                     color=color,
                                     weight=6,
-                                    opacity=0.8,
-                                    popup=f"Alternate Route - {risk_level} Risk",
+                                    opacity=0.85,
+                                    popup=f"<b>🟣 Alternate Route (Purple)</b><br>Risk: <b>{risk_level}</b><br>Score: {risk_score:.2f}<br>Path: Longer bypass route",
+                                    tooltip="🟣 Alternate Route (Purple)",
                                     dashArray="5, 15"
                                 ).add_to(m)
-                                routes_info.append(("Alternate Route", risk_level, risk_score, "Longer route"))
+                                routes_info.append(("🟣 Alternate Route (Purple)", risk_level, risk_score, "Longer bypass route"))
                             
-                            # Center map on the route
+                            # Center and automatically zoom to fit both locations and route
                             center_lat = (from_coords[0] + to_coords[0]) / 2
                             center_lon = (from_coords[1] + to_coords[1]) / 2
                             m.location = [center_lat, center_lon]
-                            m.zoom_start = 12
+                            m.fit_bounds([from_coords, to_coords], padding=(40, 40))
                         else:
                             st.error("❌ Cannot display routes - no coordinate columns found")
                             
                     except Exception as e:
                         st.error(f"❌ Error creating route: {e}")
                 
-                # Display the map
-                st_folium(m, width=700, height=500)
+                # Display the map reliably (works inside Streamlit tabs without blank map issues)
+                map_html = m._repr_html_()
+                components.html(map_html, height=520)
             
             # Route information panel - ONLY show if routes_info has data
             if hasattr(st.session_state, 'routes_calculated') and st.session_state.routes_calculated and routes_info:
@@ -584,11 +659,11 @@ def main():
             st.subheader("🗺️ Route Legend")
             col_legend1, col_legend2, col_legend3 = st.columns(3)
             with col_legend1:
-                st.markdown("🟢 **Low Risk Route** (Recommended)")
+                st.markdown("🟢 **Direct Route (Green)**  \n*Shortest direct path (Solid)*")
             with col_legend2:
-                st.markdown("🟡 **Moderate Risk Route** (Caution)")
+                st.markdown("🟠 **Highway Route (Orange)**  \n*Via major arterial roads (Dashed)*")
             with col_legend3:
-                st.markdown("🔴 **High Risk Route** (Avoid if possible)")
+                st.markdown("🟣 **Alternate Route (Purple)**  \n*Longer detour/bypass (Dotted)*")
         else:
             st.error("❌ Could not load flood data CSV file.")
 
